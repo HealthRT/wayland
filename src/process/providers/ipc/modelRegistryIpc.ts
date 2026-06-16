@@ -46,6 +46,8 @@ import type {
   IModelRegistryConnectResult,
   IModelRegistryCreds,
   IModelRegistryDetectedKey,
+  IOllamaRuntimeState,
+  IOllamaWarmResult,
   IModelRegistryProviderView,
   IModelRegistryRefreshState,
   IModelRegistryRefreshSummary,
@@ -209,13 +211,18 @@ export type ModelRegistryDeps = {
    * `initModelRegistryIpc`. A `null`/unreachable result must leave the existing
    * catalog untouched rather than emptying it.
    */
-  probeOllama?: () => Promise<OllamaProbe>;
+  probeOllama?: (baseUrl?: string) => Promise<OllamaProbe>;
+  ollamaRuntime?: {
+    getState: () => Promise<IOllamaRuntimeState>;
+    warmModel: (modelId: string) => Promise<IOllamaWarmResult>;
+  };
 };
 
 /** The fixed native provider id for the local Ollama daemon. */
 const OLLAMA_LOCAL_ID: ProviderId = 'ollama-local';
 /** The hardcoded loopback OpenAI-compatible endpoint the local Ollama provider is pinned to. */
 const OLLAMA_LOCAL_BASE_URL = 'http://127.0.0.1:11434/v1';
+const OLLAMA_WARM_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * True only when `baseUrl` parses and its host is a LOOPBACK literal
@@ -265,6 +272,8 @@ export type ModelRegistryHandlers = {
    * emitted once. Returns the genuinely-new model ids for the toast.
    */
   refreshAllOnce: () => Promise<IModelRegistryRefreshSummary>;
+  getOllamaRuntimeState: () => Promise<IOllamaRuntimeState>;
+  warmOllamaModel: (p: { modelId: string }) => Promise<IOllamaWarmResult>;
 };
 
 // ─── Handler factory ──────────────────────────────────────────────────────────
@@ -411,11 +420,11 @@ export function createModelRegistryHandlers(deps: ModelRegistryDeps): ModelRegis
    * `autoRegisterOllamaInRepo` preserves a user-changed `state` (e.g. disabled)
    * and only refreshes the catalog for an already-registered provider.
    */
-  async function refreshOllamaLocal(): Promise<'ok' | 'unreachable' | 'failed'> {
+  async function refreshOllamaLocal(baseUrl: string): Promise<'ok' | 'unreachable' | 'failed'> {
     if (!deps.probeOllama) return 'unreachable';
     let probe: OllamaProbe;
     try {
-      probe = await deps.probeOllama();
+      probe = await deps.probeOllama(baseUrl);
     } catch {
       return 'unreachable';
     }
@@ -703,6 +712,17 @@ export function createModelRegistryHandlers(deps: ModelRegistryDeps): ModelRegis
         }
         // `not-found` - nothing to refresh.
         if (stored.status !== 'ok') return { ok: false };
+
+        // `ollama-local` is intentionally keyless. Refreshing it through the
+        // generic catalog builder would assemble zero sources and replace the
+        // saved model list with `[]`. Re-probe the local daemon instead, and
+        // leave the existing catalog untouched if the daemon is unreachable.
+        if (providerId === OLLAMA_LOCAL_ID) {
+          const configuredBaseUrl = configuredOllamaBaseUrl(repo);
+          if (configuredBaseUrl.ok === false) return { ok: false };
+          return { ok: (await refreshOllamaLocal(configuredBaseUrl.baseUrl)) === 'ok' };
+        }
+
         const creds = toTestCreds(stored.creds);
         const built = await buildAndPersistCatalog(providerId, creds);
         return { ok: built.ok };
@@ -746,12 +766,14 @@ export function createModelRegistryHandlers(deps: ModelRegistryDeps): ModelRegis
           // 5): a row whose stored host is not loopback is treated like any
           // other custom provider (validated below), so the keyless+SSRF-exempt
           // allowance can never be hijacked onto a remote host.
-          if (
-            providerId === OLLAMA_LOCAL_ID &&
-            isLoopbackBaseUrl(typeof storedBaseUrl === 'string' ? storedBaseUrl : '')
-          ) {
+          if (providerId === OLLAMA_LOCAL_ID) {
+            const configuredBaseUrl = configuredOllamaBaseUrl(repo);
+            if (configuredBaseUrl.ok === false) {
+              failed.push(providerId);
+              continue;
+            }
             const ollamaBefore = new Set(repo.getRegistryCatalog(providerId).map((m) => m.id));
-            const outcome = await refreshOllamaLocal();
+            const outcome = await refreshOllamaLocal(configuredBaseUrl.baseUrl);
             if (outcome !== 'ok') {
               failed.push(providerId);
               continue;
@@ -918,6 +940,38 @@ export function createModelRegistryHandlers(deps: ModelRegistryDeps): ModelRegis
         return [];
       } catch {
         return [];
+      }
+    },
+
+    async getOllamaRuntimeState(): Promise<IOllamaRuntimeState> {
+      try {
+        return (await deps.ollamaRuntime?.getState()) ?? { reachable: false, models: {} };
+      } catch (error) {
+        return {
+          reachable: false,
+          models: {},
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+
+    async warmOllamaModel({ modelId }): Promise<IOllamaWarmResult> {
+      try {
+        if (!modelId || typeof modelId !== 'string')
+          return { ok: false, loaded: false, error: 'Model id is required.' };
+        return (
+          (await deps.ollamaRuntime?.warmModel(modelId)) ?? {
+            ok: false,
+            loaded: false,
+            error: 'Ollama runtime integration is unavailable.',
+          }
+        );
+      } catch (error) {
+        return {
+          ok: false,
+          loaded: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
       }
     },
   };
@@ -1352,8 +1406,39 @@ async function buildProductionDeps(): Promise<ModelRegistryDeps> {
     // `buildAndPersistCatalog` (Finding 1). A down/unreachable daemon resolves
     // to `{ running:false }`, which the refresh path treats as "leave the
     // existing catalog untouched" rather than wiping it.
-    probeOllama: () => probeOllamaDaemon(),
+    probeOllama: (baseUrl) => probeOllamaDaemon(baseUrl),
+    ollamaRuntime: {
+      getState: () => {
+        const configuredBaseUrl = configuredOllamaBaseUrl(_repo);
+        if (configuredBaseUrl.ok === false) {
+          return Promise.resolve({ reachable: false, models: {}, error: configuredBaseUrl.error });
+        }
+        return readOllamaRuntimeState(configuredBaseUrl.baseUrl);
+      },
+      warmModel: async (modelId: string) => {
+        const configuredBaseUrl = configuredOllamaBaseUrl(_repo);
+        if (configuredBaseUrl.ok === false) return { ok: false, loaded: false, error: configuredBaseUrl.error };
+        return warmOllamaRuntimeModel(modelId, configuredBaseUrl.baseUrl);
+      },
+    },
   };
+}
+
+function configuredOllamaBaseUrl(
+  repo?: Pick<ProviderRepository, 'getRegistryProvider' | 'getRegistryProviderCreds'>
+): { ok: true; baseUrl: string } | { ok: false; error: string } {
+  const provider = repo?.getRegistryProvider(OLLAMA_LOCAL_ID);
+  if (!provider) return { ok: false, error: 'Ollama is not connected.' };
+  const stored = repo?.getRegistryProviderCreds(OLLAMA_LOCAL_ID);
+  if (stored?.status !== 'ok') return { ok: false, error: 'Ollama credentials are unavailable.' };
+  const configuredBaseUrl =
+    typeof stored.creds.baseUrl === 'string' && stored.creds.baseUrl.trim().length > 0
+      ? stored.creds.baseUrl.trim()
+      : OLLAMA_LOCAL_BASE_URL;
+  if (!isLoopbackBaseUrl(configuredBaseUrl)) {
+    return { ok: false, error: 'Refusing to use a non-loopback Ollama endpoint.' };
+  }
+  return { ok: true, baseUrl: configuredBaseUrl };
 }
 
 /**
@@ -1362,11 +1447,11 @@ async function buildProductionDeps(): Promise<ModelRegistryDeps> {
  * `{ running:false, models:[] }`. Never throws. Mirror of `detect.probeOllama`
  * but kept here to avoid a `detect -> modelRegistryIpc` import cycle.
  */
-async function probeOllamaDaemon(): Promise<OllamaProbe> {
+async function probeOllamaDaemon(baseUrl = OLLAMA_LOCAL_BASE_URL): Promise<OllamaProbe> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 2000);
   try {
-    const res = await fetch(`${OLLAMA_LOCAL_BASE_URL.replace(/\/v1$/, '')}/api/tags`, { signal: controller.signal });
+    const res = await fetch(`${normalizeOllamaApiBaseUrl(baseUrl)}/api/tags`, { signal: controller.signal });
     if (!res.ok) return { running: false, models: [] };
     const body = (await res.json()) as unknown;
     if (!body || typeof body !== 'object') return { running: false, models: [] };
@@ -1380,6 +1465,113 @@ async function probeOllamaDaemon(): Promise<OllamaProbe> {
     return { running: false, models: [] };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+function normalizeOllamaApiBaseUrl(baseUrl?: string): string {
+  const raw = typeof baseUrl === 'string' && baseUrl.trim().length > 0 ? baseUrl.trim() : OLLAMA_LOCAL_BASE_URL;
+  return raw.replace(/\/v1\/?$/, '');
+}
+
+async function readOllamaRuntimeState(baseUrl = OLLAMA_LOCAL_BASE_URL): Promise<IOllamaRuntimeState> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+  try {
+    const res = await fetch(`${normalizeOllamaApiBaseUrl(baseUrl)}/api/ps`, { signal: controller.signal });
+    if (!res.ok) {
+      return { reachable: false, models: {}, error: `Ollama runtime returned HTTP ${res.status}.` };
+    }
+    const body = (await res.json()) as unknown;
+    const rawModels = body && typeof body === 'object' ? (body as { models?: unknown }).models : undefined;
+    if (!Array.isArray(rawModels)) return { reachable: true, models: {} };
+    const models: IOllamaRuntimeState['models'] = {};
+    for (const entry of rawModels) {
+      if (!entry || typeof entry !== 'object') continue;
+      const row = entry as {
+        model?: unknown;
+        name?: unknown;
+        expires_at?: unknown;
+        size_vram?: unknown;
+        context_length?: unknown;
+      };
+      const modelId = typeof row.model === 'string' ? row.model : typeof row.name === 'string' ? row.name : '';
+      if (!modelId) continue;
+      models[modelId] = {
+        loaded: true,
+        ...(typeof row.expires_at === 'string' ? { expiresAt: row.expires_at } : {}),
+        ...(typeof row.size_vram === 'number' ? { sizeVram: row.size_vram } : {}),
+        ...(typeof row.context_length === 'number' ? { contextLength: row.context_length } : {}),
+      };
+    }
+    return { reachable: true, models };
+  } catch (error) {
+    return {
+      reachable: false,
+      models: {},
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function warmOllamaRuntimeModel(modelId: string, baseUrl = OLLAMA_LOCAL_BASE_URL): Promise<IOllamaWarmResult> {
+  const controller = new AbortController();
+  // Cold-starting large local models can take minutes; keep the UI in Warming
+  // rather than racing the daemon and reporting a false failure.
+  const timer = setTimeout(() => controller.abort(), OLLAMA_WARM_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${normalizeOllamaApiBaseUrl(baseUrl)}/api/generate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: modelId, keep_alive: '10m', stream: false }),
+      signal: controller.signal,
+    });
+    if (!res.ok) return { ok: false, loaded: false, error: `Ollama warm request returned HTTP ${res.status}.` };
+    const body = parseOllamaGenerateResponse(await res.text());
+    if (!body || typeof body !== 'object') {
+      return { ok: false, loaded: false, error: 'Ollama warm response was empty or malformed.' };
+    }
+    const doneReason =
+      typeof (body as { done_reason?: unknown }).done_reason === 'string'
+        ? (body as { done_reason: string }).done_reason
+        : undefined;
+    const loaded = doneReason === 'load' || doneReason === 'stop';
+    return loaded
+      ? { ok: true, loaded: true }
+      : {
+          ok: false,
+          loaded: false,
+          error: doneReason ? `Ollama warm ended with "${doneReason}".` : 'Ollama warm response did not confirm load.',
+        };
+  } catch (error) {
+    return {
+      ok: false,
+      loaded: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseOllamaGenerateResponse(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Ollama streams NDJSON by default. `stream: false` should return one JSON
+    // object, but tolerate streamed/proxied responses and use the final event.
+    const lines = trimmed.split(/\r?\n/).filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        return JSON.parse(lines[i]);
+      } catch {
+        // Keep walking backward until we find a parseable event.
+      }
+    }
+    return null;
   }
 }
 
@@ -1470,7 +1662,14 @@ export async function initModelRegistryIpc(): Promise<void> {
   ipcBridge.modelRegistry.testConnection.provider((payload) => h.testConnection(payload));
   ipcBridge.modelRegistry.list.provider(() => h.list());
   ipcBridge.modelRegistry.getCatalog.provider((payload) => h.getCatalog(payload));
-  ipcBridge.modelRegistry.toggleModel.provider((payload) => h.toggleModel(payload));
+  ipcBridge.modelRegistry.toggleModel.provider(async (payload) => {
+    const result = await h.toggleModel(payload);
+    if (result.ok && _repo) {
+      await mirrorConnectOrRekey(_repo, payload.providerId);
+      ipcBridge.modelRegistry.listChanged.emit();
+    }
+    return result;
+  });
   ipcBridge.modelRegistry.refresh.provider(async (payload) => {
     const result = await h.refresh(payload);
     if (result.ok && _repo) void mirrorConnectOrRekey(_repo, payload.providerId);
@@ -1493,6 +1692,8 @@ export async function initModelRegistryIpc(): Promise<void> {
   });
   ipcBridge.modelRegistry.curatedForAgent.provider((payload) => h.curatedForAgent(payload));
   ipcBridge.modelRegistry.resolveForChatStart.provider((payload) => h.resolveForChatStart(payload));
+  ipcBridge.modelRegistry.getOllamaRuntimeState.provider(() => h.getOllamaRuntimeState());
+  ipcBridge.modelRegistry.warmOllamaModel.provider((payload) => h.warmOllamaModel(payload));
 
   // ── Provider catalog (T3.3): the ~100 connectable catalog PROVIDERS ─────────
   // A separate concept from the per-provider model registry above. The vendored
@@ -1800,4 +2001,8 @@ export async function connectModelRegistryProvider(
  */
 export async function _runStartupMigrationForTests(repo: ProviderRepository): Promise<void> {
   await runStartupMigration(repo);
+}
+
+export async function _warmOllamaRuntimeModelForTests(modelId: string, baseUrl?: string): Promise<IOllamaWarmResult> {
+  return warmOllamaRuntimeModel(modelId, baseUrl);
 }

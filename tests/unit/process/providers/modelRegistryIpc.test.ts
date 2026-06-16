@@ -40,6 +40,7 @@ import {
   createModelRegistryHandlers,
   CloudRegistrySource,
   resolveSpawnSecretsFromRepo,
+  _warmOllamaRuntimeModelForTests,
 } from '@process/providers/ipc/modelRegistryIpc';
 import type { ModelRegistryDeps, SpawnHandle } from '@process/providers/ipc/modelRegistryIpc';
 
@@ -54,7 +55,62 @@ describe('CloudRegistrySource - google-auth Gemini catalog (zero-models regressi
     } as never;
     const src = new CloudRegistrySource('google-gemini' as never, registry);
     const models = await src.listModels();
-    expect(models.map((m) => m.id).sort()).toEqual(['gemini-2.5-pro', 'gemini-flash-latest']);
+    expect(models.map((m) => m.id).toSorted()).toEqual(['gemini-2.5-pro', 'gemini-flash-latest']);
+  });
+});
+
+describe('Ollama runtime warm helper', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('disables streaming so the warm response can be parsed as one JSON object', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({ done: true, done_reason: 'load' }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(_warmOllamaRuntimeModelForTests('qwen3-coder:30b')).resolves.toEqual({ ok: true, loaded: true });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body).toMatchObject({
+      model: 'qwen3-coder:30b',
+      keep_alive: '10m',
+      stream: false,
+    });
+  });
+
+  it('tolerates an NDJSON warm response if Ollama or a proxy streams anyway', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        text: async () =>
+          [
+            JSON.stringify({ response: '', done: false }),
+            JSON.stringify({ response: '', done: true, done_reason: 'load' }),
+          ].join('\n'),
+      })
+    );
+
+    await expect(_warmOllamaRuntimeModelForTests('qwen3-coder:30b')).resolves.toEqual({ ok: true, loaded: true });
+  });
+
+  it('does not report warm success for an empty or malformed Ollama response', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        text: async () => '',
+      })
+    );
+
+    await expect(_warmOllamaRuntimeModelForTests('qwen3-coder:30b')).resolves.toEqual({
+      ok: false,
+      loaded: false,
+      error: 'Ollama warm response was empty or malformed.',
+    });
   });
 });
 import type { CatalogModel, ProviderId } from '@process/providers/types';
@@ -195,6 +251,8 @@ type Fakes = {
   getRegistry: ReturnType<typeof vi.fn>;
   apiListModels: ReturnType<typeof vi.fn>;
   cliListModels: ReturnType<typeof vi.fn>;
+  getOllamaState: ReturnType<typeof vi.fn>;
+  warmOllamaModel: ReturnType<typeof vi.fn>;
 };
 
 function makeFakes(over: Partial<{ apiModels: unknown; testResult: unknown }> = {}): Fakes {
@@ -206,6 +264,8 @@ function makeFakes(over: Partial<{ apiModels: unknown; testResult: unknown }> = 
   const getRegistry = vi.fn().mockResolvedValue({});
   const apiListModels = vi.fn().mockResolvedValue(over.apiModels ?? [{ id: 'gpt-4o', providerId: 'openai' }]);
   const cliListModels = vi.fn().mockResolvedValue([{ id: 'gpt-5-codex', providerId: 'openai' }]);
+  const getOllamaState = vi.fn().mockResolvedValue({ reachable: true, models: {} });
+  const warmOllamaModel = vi.fn().mockResolvedValue({ ok: true, loaded: true });
 
   const deps: ModelRegistryDeps = {
     repo: repo as unknown as ModelRegistryDeps['repo'],
@@ -220,6 +280,10 @@ function makeFakes(over: Partial<{ apiModels: unknown; testResult: unknown }> = 
       underlyingProviderId: agentKey === 'codex' ? 'openai' : agentKey === 'claude' ? 'anthropic' : 'google-gemini',
       listModels: cliListModels,
     }),
+    ollamaRuntime: {
+      getState: getOllamaState,
+      warmModel: warmOllamaModel,
+    },
   };
 
   return {
@@ -231,6 +295,8 @@ function makeFakes(over: Partial<{ apiModels: unknown; testResult: unknown }> = 
     getRegistry,
     apiListModels,
     cliListModels,
+    getOllamaState,
+    warmOllamaModel,
   };
 }
 
@@ -251,6 +317,31 @@ describe('modelRegistry IPC - detectKeys', () => {
     const h = createModelRegistryHandlers(deps);
 
     expect(await h.detectKeys()).toEqual([]);
+  });
+});
+
+describe('modelRegistry IPC - Ollama runtime helpers', () => {
+  it('returns live Ollama runtime state from the injected runtime adapter', async () => {
+    const { deps, getOllamaState } = makeFakes();
+    getOllamaState.mockResolvedValue({
+      reachable: true,
+      models: { 'qwen3-coder:30b': { loaded: true, contextLength: 262144 } },
+    });
+    const h = createModelRegistryHandlers(deps);
+
+    await expect(h.getOllamaRuntimeState()).resolves.toEqual({
+      reachable: true,
+      models: { 'qwen3-coder:30b': { loaded: true, contextLength: 262144 } },
+    });
+  });
+
+  it('forwards warm requests to the injected Ollama runtime adapter', async () => {
+    const { deps, warmOllamaModel } = makeFakes();
+    warmOllamaModel.mockResolvedValue({ ok: true, loaded: true });
+    const h = createModelRegistryHandlers(deps);
+
+    await expect(h.warmOllamaModel({ modelId: 'qwen3-coder:30b' })).resolves.toEqual({ ok: true, loaded: true });
+    expect(warmOllamaModel).toHaveBeenCalledWith('qwen3-coder:30b');
   });
 });
 
@@ -660,6 +751,45 @@ describe('modelRegistry IPC - refresh', () => {
 
     expect(result).toEqual({ ok: false });
     expect(repo.getRegistryProvider('openai')?.state).toBe('error');
+  });
+
+  it('re-probes keyless ollama-local instead of replacing its catalog with an empty list', async () => {
+    const { deps, repo, apiListModels } = makeFakes();
+    repo.upsertRegistryProvider({
+      providerId: 'ollama-local',
+      connectedVia: 'auto-local',
+      state: 'connected',
+      creds: { key: '', baseUrl: 'http://127.0.0.1:11434/v1' },
+    });
+    repo.replaceRegistryCatalog('ollama-local', [catalogModel({ id: 'old-model', providerId: 'ollama-local' })]);
+    deps.probeOllama = vi.fn().mockResolvedValue({ running: true, models: ['llama3:latest', 'mistral:latest'] });
+    const h = createModelRegistryHandlers(deps);
+
+    const result = await h.refresh({ providerId: 'ollama-local' });
+
+    expect(result).toEqual({ ok: true });
+    expect(deps.probeOllama).toHaveBeenCalledWith('http://127.0.0.1:11434/v1');
+    expect(apiListModels).not.toHaveBeenCalled();
+    expect(repo.getRegistryCatalog('ollama-local').map((m) => m.id)).toEqual(['llama3:latest', 'mistral:latest']);
+  });
+
+  it('uses the default loopback URL when refreshing ollama-local with no stored baseUrl', async () => {
+    const { deps, repo, apiListModels } = makeFakes();
+    repo.upsertRegistryProvider({
+      providerId: 'ollama-local',
+      connectedVia: 'auto-local',
+      state: 'connected',
+      creds: { key: '' },
+    });
+    deps.probeOllama = vi.fn().mockResolvedValue({ running: true, models: ['llama3:latest'] });
+    const h = createModelRegistryHandlers(deps);
+
+    const result = await h.refresh({ providerId: 'ollama-local' });
+
+    expect(result).toEqual({ ok: true });
+    expect(deps.probeOllama).toHaveBeenCalledWith('http://127.0.0.1:11434/v1');
+    expect(apiListModels).not.toHaveBeenCalled();
+    expect(repo.getRegistryCatalog('ollama-local').map((m) => m.id)).toEqual(['llama3:latest']);
   });
 });
 
@@ -1556,7 +1686,7 @@ describe('modelRegistry IPC - refreshAllOnce SSRF gate (ollama-local exemption)'
     const h = createModelRegistryHandlers(deps);
     const summary = await h.refreshAllOnce();
 
-    expect(probeOllama).toHaveBeenCalledTimes(1);
+    expect(probeOllama).toHaveBeenCalledWith('http://127.0.0.1:11434/v1');
     expect(summary.succeeded).toContain('ollama-local');
     // Catalog refreshed from the live probe (not wiped to empty).
     expect(repo.getRegistryCatalog('ollama-local').map((m) => m.id)).toEqual(['llama3:latest']);

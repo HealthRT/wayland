@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { WCoreModelSelection } from './useWCoreModelSelection';
+import { registryProviderIdFor, type WCoreModelSelection } from './useWCoreModelSelection';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { getModelDisplayLabel } from '@/renderer/utils/model/agentLogo';
@@ -15,6 +15,68 @@ import classNames from 'classnames';
 import useSWR from 'swr';
 import { ipcBridge } from '@/common';
 import type { IProvider } from '@/common/config/storage';
+import type { IOllamaRuntimeState } from '@/common/adapter/ipcBridge';
+
+type ModelStatusView = {
+  status: 'healthy' | 'unhealthy' | 'unknown' | 'warming';
+  color: string;
+  label?: string;
+  tooltip?: string;
+};
+
+function getModelStatusView(args: {
+  providerId?: string;
+  modelName?: string;
+  modelHealthStatus?: 'unknown' | 'healthy' | 'unhealthy';
+  ollamaRuntimeState?: IOllamaRuntimeState;
+  warmingModelId?: string | null;
+}): ModelStatusView {
+  const { providerId, modelName, modelHealthStatus = 'unknown', ollamaRuntimeState, warmingModelId } = args;
+  if (providerId === 'ollama-local' && modelName) {
+    if (warmingModelId === modelName) {
+      return {
+        status: 'warming',
+        color: 'bg-orange-400',
+        label: 'Warming',
+        tooltip: 'Wayland is asking Ollama to load this model into memory.',
+      };
+    }
+    if (!ollamaRuntimeState?.reachable) {
+      if (!ollamaRuntimeState) {
+        return {
+          status: 'unknown',
+          color: 'bg-gray-400',
+          label: 'Checking',
+          tooltip: 'Wayland is checking the local Ollama runtime.',
+        };
+      }
+      return {
+        status: 'unhealthy',
+        color: 'bg-red-500',
+        label: 'Unavailable',
+        tooltip: ollamaRuntimeState?.error || 'Wayland cannot reach the local Ollama runtime.',
+      };
+    }
+    if (ollamaRuntimeState.models[modelName]?.loaded) {
+      return {
+        status: 'healthy',
+        color: 'bg-green-500',
+        label: 'Loaded',
+        tooltip: 'This model is currently loaded in Ollama memory.',
+      };
+    }
+    return {
+      status: 'unknown',
+      color: 'bg-gray-400',
+      label: 'Cold',
+      tooltip: 'This model is installed in Ollama but not currently loaded.',
+    };
+  }
+
+  const healthColor =
+    modelHealthStatus === 'healthy' ? 'bg-green-500' : modelHealthStatus === 'unhealthy' ? 'bg-red-500' : 'bg-gray-400';
+  return { status: modelHealthStatus, color: healthColor };
+}
 
 const WCoreModelSelector: React.FC<{
   selection?: WCoreModelSelection;
@@ -41,15 +103,37 @@ const WCoreModelSelector: React.FC<{
     });
   }, [mutateModelConfig]);
 
+  const hasOllamaProvider = Boolean(
+    selection?.providers.some((provider) => registryProviderIdFor(provider) === 'ollama-local')
+  );
+  const { data: ollamaRuntimeState, mutate: mutateOllamaRuntimeState } = useSWR<IOllamaRuntimeState | null>(
+    hasOllamaProvider ? 'modelRegistry.ollama.runtime' : null,
+    () => ipcBridge.modelRegistry.getOllamaRuntimeState.invoke()
+  );
+
+  useEffect(() => {
+    if (!hasOllamaProvider) return;
+    void mutateOllamaRuntimeState();
+  }, [
+    hasOllamaProvider,
+    mutateOllamaRuntimeState,
+    selection?.currentModel?.id,
+    selection?.currentModel?.useModel,
+    selection?.runtimeRefreshNonce,
+  ]);
+
   const currentModel = selection?.currentModel;
   const currentModelHealth = useMemo(() => {
-    if (!currentModel || !modelConfig) return { status: 'unknown', color: 'bg-gray-400' };
+    if (!currentModel || !modelConfig) return { status: 'unknown', color: 'bg-gray-400' } as ModelStatusView;
     const matchedProvider = modelConfig.find((p) => p.id === currentModel.id);
-    const healthStatus = matchedProvider?.modelHealth?.[currentModel.useModel]?.status || 'unknown';
-    const healthColor =
-      healthStatus === 'healthy' ? 'bg-green-500' : healthStatus === 'unhealthy' ? 'bg-red-500' : 'bg-gray-400';
-    return { status: healthStatus, color: healthColor };
-  }, [currentModel, modelConfig]);
+    return getModelStatusView({
+      providerId: registryProviderIdFor(currentModel),
+      modelName: currentModel.useModel,
+      modelHealthStatus: matchedProvider?.modelHealth?.[currentModel.useModel]?.status || 'unknown',
+      ollamaRuntimeState: ollamaRuntimeState ?? undefined,
+      warmingModelId: selection?.warmingModelId,
+    });
+  }, [currentModel, modelConfig, ollamaRuntimeState, selection?.warmingModelId]);
 
   if (disabled || !selection) {
     return (
@@ -94,13 +178,14 @@ const WCoreModelSelector: React.FC<{
               <Menu.ItemGroup title={provider.name} key={provider.id}>
                 {models.map((modelName) => {
                   const matchedProvider = modelConfig?.find((p) => p.id === provider.id);
-                  const healthStatus = matchedProvider?.modelHealth?.[modelName]?.status || 'unknown';
-                  const healthColor =
-                    healthStatus === 'healthy'
-                      ? 'bg-green-500'
-                      : healthStatus === 'unhealthy'
-                        ? 'bg-red-500'
-                        : 'bg-gray-400';
+                  const providerRegistryId = registryProviderIdFor(provider);
+                  const statusView = getModelStatusView({
+                    providerId: providerRegistryId,
+                    modelName,
+                    modelHealthStatus: matchedProvider?.modelHealth?.[modelName]?.status || 'unknown',
+                    ollamaRuntimeState: ollamaRuntimeState ?? undefined,
+                    warmingModelId: selection.warmingModelId,
+                  });
 
                   return (
                     <Menu.Item
@@ -109,10 +194,15 @@ const WCoreModelSelector: React.FC<{
                       onClick={() => void handleSelectModel(provider, modelName)}
                     >
                       <div className='flex items-center gap-8px w-full'>
-                        {healthStatus !== 'unknown' && (
-                          <div className={`w-6px h-6px rounded-full shrink-0 ${healthColor}`} />
+                        {statusView.status !== 'unknown' && (
+                          <div className={`w-6px h-6px rounded-full shrink-0 ${statusView.color}`} />
                         )}
-                        <span>{modelName}</span>
+                        <span className='flex-1 min-w-0 truncate'>{modelName}</span>
+                        {statusView.label && (
+                          <span className='text-12px opacity-60 shrink-0' title={statusView.tooltip}>
+                            {statusView.label}
+                          </span>
+                        )}
                       </div>
                     </Menu.Item>
                   );
@@ -137,6 +227,9 @@ const WCoreModelSelector: React.FC<{
             <div className={`w-6px h-6px rounded-full shrink-0 ${currentModelHealth.color}`} />
           )}
           <span className={compact ? 'block truncate' : undefined}>{label}</span>
+          {!compact && currentModelHealth.label && (
+            <span className='text-12px opacity-60 shrink-0'>{currentModelHealth.label}</span>
+          )}
         </span>
       </Button>
     </Dropdown>

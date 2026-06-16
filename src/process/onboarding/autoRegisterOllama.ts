@@ -27,6 +27,7 @@
  */
 
 import type { CatalogModel, ProviderId } from '@process/providers/types';
+import { isUnsupportedLocalVisionModel } from '@process/providers/catalog/localVisionModelFilter';
 
 /** The fixed native provider id for the local Ollama daemon. */
 const OLLAMA_LOCAL_ID: ProviderId = 'ollama-local';
@@ -55,19 +56,31 @@ export type AutoRegisterOutcome =
   | { action: 'refreshed'; models: number }
   | { action: 'skipped' };
 
+function inferOllamaKind(name: string): CatalogModel['kind'] {
+  const id = name.toLowerCase();
+  if (id.includes('embed') || id.includes('embedding')) return 'embedding';
+  return 'text';
+}
+
+function inferOllamaTags(name: string, kind: CatalogModel['kind']): CatalogModel['tags'] {
+  if (kind === 'embedding') return ['embeddings'];
+  return ['chat'];
+}
+
 /**
  * Build a minimal `CatalogModel` for a model name reported by `/api/tags`. The
  * name is the id verbatim (e.g. `llama3:latest`); no enrichment is fabricated.
  */
 function toCatalogModel(name: string): CatalogModel {
+  const kind = inferOllamaKind(name);
   return {
     id: name,
     providerId: OLLAMA_LOCAL_ID,
     displayName: name,
     family: name.split(':')[0] || name,
-    kind: 'text',
+    kind,
     enriched: false,
-    tags: ['chat'],
+    tags: inferOllamaTags(name, kind),
   };
 }
 
@@ -98,7 +111,9 @@ export function autoRegisterOllamaInRepo(repo: OllamaRegistryRepo, probe: Ollama
   try {
     if (!probe.running) return { action: 'skipped' };
 
-    const models = normalizeModelNames(probe.models).map(toCatalogModel);
+    const models = normalizeModelNames(probe.models)
+      .filter((name) => !isUnsupportedLocalVisionModel(OLLAMA_LOCAL_ID, name))
+      .map(toCatalogModel);
     const existing = repo.getRegistryProvider(OLLAMA_LOCAL_ID);
 
     if (existing) {
